@@ -135,8 +135,31 @@ async def portfolio(auth=Depends(require_auth)):
 
 @router.get("/market/quote")
 async def market_quote(ticker: str = Query("SPY"), auth=Depends(optional_auth)):
-    """Get real-time or simulated market quote."""
+    """Get real-time or simulated market quote. DB-cached, YFinance fallback."""
     import yfinance as yf
+    import psycopg2
+    from datetime import datetime as dt
+
+    try:
+        conn = psycopg2.connect(host="market-db", port=5432, dbname="ai_trading_db",
+                                user="trading_user", password="xWt/ZNaFA40T/uYnGN4QhO2ieUJj7JM5")
+        cur = conn.cursor()
+        cur.execute("SELECT close,high,low,open,volume,date FROM market_data WHERE ticker=%s AND date=(SELECT MAX(date) FROM market_data WHERE ticker=%s)", (ticker.upper(), ticker.upper()))
+        row = cur.fetchone()
+        cur.execute("SELECT close FROM market_data WHERE ticker=%s AND date<(SELECT MAX(date) FROM market_data WHERE ticker=%s) ORDER BY date DESC LIMIT 1", (ticker.upper(), ticker.upper()))
+        prev = cur.fetchone()
+        conn.close()
+        if row and prev:
+            c,h,l,o,v,d = float(row[0]),float(row[1]),float(row[2]),float(row[3]),int(row[4]),row[5]
+            pc = float(prev[0])
+            chg = c-pc; pct = (chg/pc*100) if pc>0 else 0
+            return {"ticker": ticker.upper(), "price": round(c,2), "change": round(chg,2),
+                    "change_pct": round(pct,2), "high": round(h,2), "low": round(l,2),
+                    "open": round(o,2), "volume": v, "prev_close": round(pc,2),
+                    "timestamp": dt.now().isoformat(), "source": "cache"}
+    except:
+        pass
+
     try:
         df = yf.download(ticker, period="5d", progress=False, auto_adjust=True)
         if df.empty:
