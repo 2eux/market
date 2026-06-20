@@ -159,6 +159,7 @@ async def root():
   corporate_actions — splits, dividends</pre>
     </div>
 
+      <a href="/trade" style="display:block;text-align:center;margin:1rem 0;color:#00d4aa;font-weight:600;">⚡ GO TO TRADING →</a>
     <footer>
       ZE Head Office — Quantitative Strategy Division<br>
       RULES_MARKET-REV-004 | Grade A++ | Last Verified: 2026-06-17
