@@ -347,7 +347,7 @@ async def system_health():
     try:
         conn = psycopg2.connect(host="market-db", port=5432,
                                 dbname="ai_trading_db", user="trading_user",
-                                password=os.getenv("DB_PASSWORD", ""))
+                                password="xWt/ZNaFA40T/uYnGN4QhO2ieUJj7JM5")
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM market_data")
         db_rows = cur.fetchone()[0]
