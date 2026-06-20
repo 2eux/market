@@ -1,3 +1,4 @@
+import pandas as pd
 """
 KRONOS AI — Trading API Routes
 """
@@ -140,9 +141,15 @@ async def market_quote(ticker: str = Query("SPY"), auth=Depends(optional_auth)):
         df = yf.download(ticker, period="5d", progress=False, auto_adjust=True)
         if df.empty:
             return JSONResponse({"error": f"No data for {ticker}"}, status_code=404)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+        numeric_cols = ['Open','High','Low','Close','Adj Close']
+        for c in numeric_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
         latest = df.iloc[-1]
         prev = df.iloc[-2] if len(df) > 1 else latest
-        change = float(latest["Close"] - prev["Close"])
+        change = float(latest["Close"]) - float(prev["Close"])
         change_pct = (change / float(prev["Close"]) * 100) if float(prev["Close"]) > 0 else 0
 
         return {
@@ -175,6 +182,8 @@ async def trade_buy(ticker: str = Query(...), qty: int = Query(1),
         df = yf.download(ticker, period="1d", progress=False, auto_adjust=True)
         if df.empty:
             return JSONResponse({"error": f"Cannot price {ticker}"}, status_code=400)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
         price = float(df.iloc[-1]["Close"])
     except Exception as e:
         return JSONResponse({"error": f"Price fetch failed: {e}"}, status_code=500)
@@ -247,6 +256,8 @@ async def trade_sell(ticker: str = Query(...), qty: int = Query(None),
         df = yf.download(ticker, period="1d", progress=False, auto_adjust=True)
         if df.empty:
             return JSONResponse({"error": f"Cannot price {ticker}"}, status_code=400)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
         price = float(df.iloc[-1]["Close"])
     except Exception as e:
         return JSONResponse({"error": f"Price fetch failed: {e}"}, status_code=500)
