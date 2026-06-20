@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KRONOS AI — Trade</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0f; color: #e0e0e0; min-height: 100vh; }
+.container { max-width: 600px; margin: 0 auto; padding: 2rem; }
+h1 { text-align: center; font-size: 1.5rem; font-weight: 300; color: #00d4aa; margin-bottom: 1.5rem; }
+.card { background: #111118; border: 1px solid #1a1a2e; border-radius: 12px; padding: 1.5rem; margin-bottom: 1rem; }
+.card h3 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px; color: #666; margin-bottom: 0.5rem; }
+.input-row { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.5rem; }
+input { padding: 0.75rem; border: 1px solid #1a1a2e; border-radius: 6px; background: #0d0d15; color: #e0e0e0; font-size: 1rem; }
+input:focus { outline: none; border-color: #00d4aa; }
+input[type="text"] { flex: 1; min-width: 120px; }
+input[type="number"] { width: 80px; }
+input[type="password"] { flex: 1; min-width: 180px; }
+.btn-row { display: flex; gap: 0.5rem; }
+.btn { flex: 1; padding: 0.75rem; border: none; border-radius: 6px; font-size: 1rem; font-weight: 600; cursor: pointer; }
+.btn-buy { background: #00d4aa; color: #000; }
+.btn-sell { background: #ff6688; color: #fff; }
+.btn-ref { background: #333; color: #e0e0e0; width: 48px; flex: none; font-size: 1.2rem; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+#result { margin-top: 0.5rem; font-size: 0.9rem; min-height: 1.5rem; }
+#result.success { color: #00d4aa; }
+#result.error { color: #ff6688; }
+#result.loading { color: #888; }
+.pos-row { display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: 1px solid #0d0d15; font-size: 0.85rem; }
+.pos-row:last-child { border-bottom: none; }
+.pos-ticker { font-weight: 600; color: #fff; width: 60px; }
+.pos-price { color: #888; }
+.pos-pnl { font-weight: 600; text-align: right; flex: 1; }
+.pos-pnl.pos { color: #00d4aa; }
+.pos-pnl.neg { color: #ff6688; }
+.summary { text-align: center; padding: 0.5rem; font-size: 0.85rem; }
+.summary b { color: #00d4aa; }
+a { color: #66aaff; text-decoration: none; font-size: 0.8rem; display: block; text-align: center; margin-top: 1rem; }
+a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>KRONOS AI ⚡ TRADE</h1>
+<div class="card">
+<h3>Authentication</h3>
+<div class="input-row">
+<input id="apiKey" type="password" placeholder="Enter API Key" autocomplete="off">
+<button class="btn btn-ref" onclick="loadPortfolio()">&#x21bb;</button>
+</div>
+</div>
+<div class="card">
+<h3>Place Order</h3>
+<div class="input-row">
+<input id="ticker" type="text" placeholder="Ticker" value="TLT" oninput="this.value=this.value.toUpperCase()">
+<input id="qty" type="number" value="1" min="1" max="100">
+</div>
+<div class="btn-row">
+<button class="btn btn-buy" onclick="trade('buy')" id="buyBtn">BUY</button>
+<button class="btn btn-sell" onclick="trade('sell')" id="sellBtn">SELL</button>
+</div>
+<div id="result"></div>
+</div>
+<div class="card">
+<h3>Portfolio</h3>
+<div id="portfolio"><div class="summary">Enter API key and click &#x21bb;</div></div>
+</div>
+<a href="/">&#8592; Back to Dashboard</a>
+</div>
+<script>
+const API = window.location.origin;
+function $(id) { return document.getElementById(id); }
+function key() { return $("apiKey").value; }
+function btn(s, d) { var b = d ? $("buyBtn") : $("sellBtn"); b.disabled = s; b.textContent = d || (s ? "..." : (d === false ? "BUY" : "SELL")); }
+
+async function trade(side) {
+  var k = key();
+  if (!k) { $("result").className = "error"; $("result").textContent = "Enter API key first"; return; }
+  var t = $("ticker").value; var q = $("qty").value;
+  $("result").className = "loading"; $("result").textContent = "Placing order...";
+  btn(true, side === "buy" ? "Buying..." : "Selling...");
+  try {
+    var r = await fetch(API + "/api/trade/" + side + "?ticker=" + t + "&qty=" + q, { method: "POST", headers: { "X-API-Key": k } });
+    var d = await r.json();
+    if (d.error) { $("result").className = "error"; $("result").textContent = d.error; }
+    else { $("result").className = "success"; $("result").textContent = d.status.toUpperCase() + " " + d.ticker + " x" + d.qty + " @ $" + d.price; }
+  } catch(e) { $("result").className = "error"; $("result").textContent = e.message; }
+  btn(false); loadPortfolio();
+}
+
+async function loadPortfolio() {
+  var k = key();
+  if (!k) { $("portfolio").innerHTML = "<div class=\\"summary\\">Enter API key</div>"; return; }
+  try {
+    var r = await fetch(API + "/api/portfolio", { headers: { "X-API-Key": k } });
+    var d = await r.json();
+    var html = "<div class=\\"summary\\">Value: <b>$" + d.total_value.toFixed(2) + "</b> &nbsp;|&nbsp; Cash: $" + d.cash.toFixed(2) + " &nbsp;|&nbsp; " + d.positions_count + " positions</div>";
+    if (d.positions.length > 0) {
+      d.positions.forEach(function(p) {
+        var cls = p.pnl >= 0 ? "pos" : "neg";
+        var sign = p.pnl >= 0 ? "+" : "";
+        html += "<div class=\\"pos-row\\"><span class=\\"pos-ticker\\">" + p.ticker + "</span>";
+        html += "<span class=\\"pos-price\\">x" + p.qty + " @ $" + p.avg_entry + " &rarr; $" + p.current_price + "</span>";
+        html += "<span class=\\"pos-pnl " + cls + "\\">" + sign + p.pnl.toFixed(2) + " (" + sign + p.pnl_pct.toFixed(1) + "%)</span></div>";
+      });
+    }
+    $("portfolio").innerHTML = html;
+  } catch(e) { $("portfolio").innerHTML = "<div class=\\"summary error\\">Error loading portfolio</div>"; }
+}
+</script>
+</body>
+</html>

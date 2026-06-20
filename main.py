@@ -219,5 +219,14 @@ async def tiers():
     })
 
 
+
+@app.get("/trade", response_class=HTMLResponse)
+async def trade_page():
+    """Manual trading interface."""
+    from pathlib import Path
+    html = Path(__file__).parent / "templates" / "trade.html"
+    if html.exists():
+        return html.read_text()
+    return "<h1>Trade page not found</h1>"
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=3000, log_level="info")
