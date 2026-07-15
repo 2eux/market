@@ -1,4 +1,3 @@
-import pandas as pd
 """
 KRONOS AI — Trading API Routes
 """
@@ -12,11 +11,13 @@ from datetime import datetime, timezone, date
 from typing import Optional
 from decimal import Decimal
 
+import pandas as pd
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.responses import JSONResponse
 import httpx
 
 from .auth import require_auth, optional_auth, verify_api_key
+from . import gateway
 
 router = APIRouter()
 
@@ -32,13 +33,63 @@ IBKR_CONFIG = {
     "mode": os.getenv("TRADING_MODE", "paper"),
 }
 
-# Simulated portfolio state
+# Simulated portfolio state (fallback)
 _portfolio = {
     "cash": 200.00,
     "positions": {},
     "orders": [],
     "pnl_history": [],
 }
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+async def get_ibkr_price(ticker: str) -> Optional[float]:
+    """Get real-time price from IBKR gateway. Falls back to yfinance."""
+    quote = await gateway.gw_get(f"/v1/api/marketdata/history?symbol={ticker}&period=1d&bar=1d")
+    if quote and "data" in quote:
+        try:
+            return float(quote["data"][-1]["c"])
+        except:
+            pass
+    # Fallback to yfinance
+    try:
+        import yfinance as yf
+        df = yf.download(ticker, period="1d", progress=False, auto_adjust=True)
+        if df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+        return float(df.iloc[-1]["Close"])
+    except:
+        return None
+
+
+async def try_gateway_trade(ticker: str, qty: int, side: str, price: float) -> Optional[dict]:
+    """Try to execute trade through IBKR. Returns None if gateway fails."""
+    try:
+        # Check if gateway is alive
+        gw_status = await gateway.check_gateway()
+        if gw_status.get("authenticated") == False and gw_status.get("connected") == False:
+            return None
+
+        result = await gateway.place_ibkr_order(ticker, qty, side)
+        if result and "error" not in result:
+            return {
+                "status": "filled",
+                "order_id": str(uuid.uuid4())[:8],
+                "ticker": ticker,
+                "qty": qty,
+                "price": round(price, 2),
+                "total": round(price * qty, 2),
+                "source": "ibkr",
+                "gateway_response": result,
+            }
+        return None
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -64,15 +115,24 @@ async def login(api_key: str = Query(None)):
 @router.get("/account")
 async def account_status(auth=Depends(require_auth)):
     """Get account status and capital tier info."""
-    capital = _portfolio["cash"]
-    for sym, pos in _portfolio["positions"].items():
-        capital += pos["market_value"]
+    # Try IBKR gateway first
+    ibkr_summary = await gateway.get_ibkr_summary()
+    if ibkr_summary:
+        total_cash = float(ibkr_summary.get("totalcashvalue", 0) or 0)
+        total_val = float(ibkr_summary.get("netliquidation", total_cash) or total_cash)
+        # Update simulated state from real data
+        _portfolio["cash"] = total_cash
+    else:
+        total_val = _portfolio["cash"]
+        for sym, pos in _portfolio["positions"].items():
+            total_val += pos.get("market_value", pos["qty"] * pos["avg_entry"])
+        total_cash = _portfolio["cash"]
 
-    if capital < 200:
+    if total_val < 200:
         tier = "<$200 — Micro (Cash)"
-    elif capital < 2000:
+    elif total_val < 2000:
         tier = "$200–$2k — Cash (Growing)"
-    elif capital < 25000:
+    elif total_val < 25000:
         tier = "$2k–$25k — Reg T Margin"
     else:
         tier = "$25k+ — Infrastructure Tier"
@@ -82,14 +142,16 @@ async def account_status(auth=Depends(require_auth)):
         "broker": "Interactive Brokers",
         "plan": IBKR_CONFIG.get("plan", "Lite"),
         "mode": IBKR_CONFIG["mode"],
-        "capital": round(capital, 2),
-        "cash": round(_portfolio["cash"], 2),
+        "capital": round(total_val, 2),
+        "cash": round(total_cash, 2),
         "tier": tier,
         "positions_count": len(_portfolio["positions"]),
         "open_orders": len([o for o in _portfolio["orders"] if o["status"] == "open"]),
         "day_pnl": round(sum(o.get("pnl", 0) for o in _portfolio["pnl_history"]
                              if o.get("date") == str(date.today())), 2),
-        "last_verified": "2026-06-17",
+        "last_verified": datetime.now(timezone.utc).isoformat(),
+        "gateway_connected": ibkr_summary is not None,
+        "data_source": "ibkr" if ibkr_summary else "simulated",
         "regulatory": {
             "pdt_eliminated": True,
             "finra_notice": "26-10",
@@ -100,7 +162,49 @@ async def account_status(auth=Depends(require_auth)):
 
 @router.get("/portfolio")
 async def portfolio(auth=Depends(require_auth)):
-    """Get current portfolio positions."""
+    """Get current portfolio positions. Uses IBKR when available."""
+    # Try IBKR gateway first
+    ibkr_positions = await gateway.get_ibkr_positions()
+
+    if ibkr_positions:
+        # Use real positions from IBKR
+        positions = []
+        total_value = 0
+        for pos in ibkr_positions:
+            ticker = pos.get("contractDesc", "?")
+            qty = float(pos.get("position", 0))
+            mkt_val = float(pos.get("marketValue", 0))
+            cost = float(pos.get("costBasisPrice", 0))
+            pnl = float(pos.get("unrealizedPnl", 0))
+            total_value += mkt_val
+
+            positions.append({
+                "ticker": ticker,
+                "qty": qty,
+                "avg_entry": round(cost, 2),
+                "current_price": round(mkt_val / qty if qty > 0 else 0, 2),
+                "market_value": round(mkt_val, 2),
+                "cost_basis": round(cost * qty, 2),
+                "pnl": round(pnl, 2),
+                "pnl_pct": round(pnl / (cost * qty) * 100 if cost * qty > 0 else 0, 2),
+                "source": "ibkr",
+            })
+
+        # Get cash from summary
+        summary = await gateway.get_ibkr_summary()
+        cash = float(summary.get("totalcashvalue", 0)) if summary else _portfolio["cash"]
+        total_value += cash
+
+        return {
+            "total_value": round(total_value, 2),
+            "cash": round(cash, 2),
+            "invested": round(total_value - cash, 2),
+            "positions": positions,
+            "positions_count": len(positions),
+            "source": "ibkr",
+        }
+
+    # Fallback to simulated portfolio
     positions = []
     total_value = _portfolio["cash"]
 
@@ -122,6 +226,7 @@ async def portfolio(auth=Depends(require_auth)):
             "pnl_pct": round(pnl_pct, 2),
             "day_change": round(pos.get("day_change", 0), 2),
             "day_change_pct": round(pos.get("day_change_pct", 0), 2),
+            "source": "simulated",
         })
 
     return {
@@ -130,19 +235,42 @@ async def portfolio(auth=Depends(require_auth)):
         "invested": round(total_value - _portfolio["cash"], 2),
         "positions": positions,
         "positions_count": len(positions),
+        "source": "simulated",
     }
 
 
 @router.get("/market/quote")
 async def market_quote(ticker: str = Query("SPY"), auth=Depends(optional_auth)):
-    """Get real-time or simulated market quote. DB-cached, YFinance fallback."""
+    """Get real-time market quote. Tries IBKR, then DB cache, then YFinance."""
     import yfinance as yf
     import psycopg2
     from datetime import datetime as dt
 
+    # Try IBKR gateway first
+    ibkr_price = await gateway.gw_get(f"/v1/api/marketdata/history?symbol={ticker}&period=1d&bar=1d")
+    if ibkr_price and "data" in ibkr_price:
+        try:
+            data = ibkr_price["data"]
+            if data and len(data) > 0:
+                last = data[-1]
+                c = float(last["c"])
+                o = float(last.get("o", c))
+                h = float(last.get("h", c))
+                l = float(last.get("l", c))
+                v = int(last.get("v", 0))
+                return {
+                    "ticker": ticker.upper(), "price": round(c, 2),
+                    "high": round(h, 2), "low": round(l, 2),
+                    "open": round(o, 2), "volume": v,
+                    "timestamp": dt.now().isoformat(), "source": "ibkr",
+                }
+        except:
+            pass
+
+    # Try DB cache
     try:
         conn = psycopg2.connect(host="market-db", port=5432, dbname="ai_trading_db",
-                                user="trading_user", password="xWt/ZNaFA40T/uYnGN4QhO2ieUJj7JM5")
+                                user="trading_user", password="xWt/ZNaFA40T/uYnGN4QhO2ieUjJ7JM5")
         cur = conn.cursor()
         cur.execute("SELECT close,high,low,open,volume,date FROM market_data WHERE ticker=%s AND date=(SELECT MAX(date) FROM market_data WHERE ticker=%s)", (ticker.upper(), ticker.upper()))
         row = cur.fetchone()
@@ -160,6 +288,7 @@ async def market_quote(ticker: str = Query("SPY"), auth=Depends(optional_auth)):
     except:
         pass
 
+    # YFinance fallback
     try:
         df = yf.download(ticker, period="5d", progress=False, auto_adjust=True)
         if df.empty:
@@ -176,17 +305,12 @@ async def market_quote(ticker: str = Query("SPY"), auth=Depends(optional_auth)):
         change_pct = (change / float(prev["Close"]) * 100) if float(prev["Close"]) > 0 else 0
 
         return {
-            "ticker": ticker.upper(),
-            "price": round(float(latest["Close"]), 2),
-            "change": round(change, 2),
-            "change_pct": round(change_pct, 2),
-            "high": round(float(latest["High"]), 2),
-            "low": round(float(latest["Low"]), 2),
-            "volume": int(latest["Volume"]),
-            "open": round(float(latest["Open"]), 2),
+            "ticker": ticker.upper(), "price": round(float(latest["Close"]), 2),
+            "change": round(change, 2), "change_pct": round(change_pct, 2),
+            "high": round(float(latest["High"]), 2), "low": round(float(latest["Low"]), 2),
+            "volume": int(latest["Volume"]), "open": round(float(latest["Open"]), 2),
             "prev_close": round(float(prev["Close"]), 2),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "source": "yfinance",
+            "timestamp": datetime.now(timezone.utc).isoformat(), "source": "yfinance",
         }
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -195,29 +319,31 @@ async def market_quote(ticker: str = Query("SPY"), auth=Depends(optional_auth)):
 @router.post("/trade/buy")
 async def trade_buy(ticker: str = Query(...), qty: int = Query(1),
                     order_type: str = Query("market"), auth=Depends(require_auth)):
-    """Execute a buy order."""
+    """Execute a buy order. Routes through IBKR when gateway is available."""
     if auth["role"] != "full_access":
         raise HTTPException(status_code=403, detail="Full access required for trading")
 
     # Get current price
-    import yfinance as yf
-    try:
-        df = yf.download(ticker, period="1d", progress=False, auto_adjust=True)
-        if df.empty:
-            return JSONResponse({"error": f"Cannot price {ticker}"}, status_code=400)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] for c in df.columns]
-        price = float(df.iloc[-1]["Close"])
-    except Exception as e:
-        return JSONResponse({"error": f"Price fetch failed: {e}"}, status_code=500)
+    price = await get_ibkr_price(ticker)
+    if price is None:
+        return JSONResponse({"error": f"Cannot price {ticker}"}, status_code=400)
 
-    cost = price * qty * 1.0005  # include 5bps slippage
+    cost = price * qty * 1.0005
     if cost > _portfolio["cash"]:
         return JSONResponse({
             "error": f"Insufficient funds. Need ${cost:.2f}, have ${_portfolio['cash']:.2f}"
         }, status_code=400)
 
-    # Execute
+    # Try IBKR gateway first
+    ibkr_result = await try_gateway_trade(ticker, qty, "buy", price)
+    if ibkr_result:
+        _portfolio["cash"] -= cost
+        _portfolio["orders"].append(ibkr_result)
+        ibkr_result["cash_remaining"] = round(_portfolio["cash"], 2)
+        ibkr_result["total"] = round(cost, 2)
+        return ibkr_result
+
+    # Fallback to simulated
     _portfolio["cash"] -= cost
     order_id = str(uuid.uuid4())[:8]
 
@@ -228,39 +354,27 @@ async def trade_buy(ticker: str = Query(...), qty: int = Query(1),
         pos["qty"] = total_qty
     else:
         _portfolio["positions"][ticker] = {
-            "qty": qty,
-            "avg_entry": price,
-            "current_price": price,
-            "day_change": 0,
-            "day_change_pct": 0,
+            "qty": qty, "avg_entry": price, "current_price": price,
+            "day_change": 0, "day_change_pct": 0,
         }
 
     _portfolio["orders"].append({
-        "id": order_id,
-        "ticker": ticker,
-        "side": "buy",
-        "qty": qty,
-        "price": round(price, 2),
-        "total": round(cost, 2),
-        "status": "filled",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "id": order_id, "ticker": ticker, "side": "buy", "qty": qty,
+        "price": round(price, 2), "total": round(cost, 2), "status": "filled",
+        "timestamp": datetime.now(timezone.utc).isoformat(), "source": "simulated",
     })
 
     return {
-        "status": "filled",
-        "order_id": order_id,
-        "ticker": ticker,
-        "qty": qty,
-        "price": round(price, 2),
-        "total": round(cost, 2),
-        "cash_remaining": round(_portfolio["cash"], 2),
+        "status": "filled", "order_id": order_id, "ticker": ticker, "qty": qty,
+        "price": round(price, 2), "total": round(cost, 2),
+        "cash_remaining": round(_portfolio["cash"], 2), "source": "simulated",
     }
 
 
 @router.post("/trade/sell")
 async def trade_sell(ticker: str = Query(...), qty: int = Query(None),
                      auth=Depends(require_auth)):
-    """Execute a sell order."""
+    """Execute a sell order. Routes through IBKR when gateway is available."""
     if auth["role"] != "full_access":
         raise HTTPException(status_code=403, detail="Full access required")
 
@@ -269,60 +383,57 @@ async def trade_sell(ticker: str = Query(...), qty: int = Query(None),
 
     pos = _portfolio["positions"][ticker]
     sell_qty = qty if qty else pos["qty"]
-
     if sell_qty > pos["qty"]:
         return JSONResponse({"error": f"Only have {pos['qty']} shares of {ticker}"}, status_code=400)
 
     # Get current price
-    import yfinance as yf
-    try:
-        df = yf.download(ticker, period="1d", progress=False, auto_adjust=True)
-        if df.empty:
-            return JSONResponse({"error": f"Cannot price {ticker}"}, status_code=400)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] for c in df.columns]
-        price = float(df.iloc[-1]["Close"])
-    except Exception as e:
-        return JSONResponse({"error": f"Price fetch failed: {e}"}, status_code=500)
+    price = await get_ibkr_price(ticker)
+    if price is None:
+        return JSONResponse({"error": f"Cannot price {ticker}"}, status_code=400)
 
+    # Try IBKR gateway first
+    ibkr_result = await try_gateway_trade(ticker, sell_qty, "sell", price)
+    if ibkr_result:
+        proceeds = price * sell_qty * 0.9995
+        pnl = (price - pos["avg_entry"]) * sell_qty
+        _portfolio["cash"] += proceeds
+        pos["qty"] -= sell_qty
+        if pos["qty"] <= 0:
+            del _portfolio["positions"][ticker]
+
+        _portfolio["orders"].append(ibkr_result)
+        ibkr_result["proceeds"] = round(proceeds, 2)
+        ibkr_result["pnl"] = round(pnl, 2)
+        ibkr_result["cash_balance"] = round(_portfolio["cash"], 2)
+        return ibkr_result
+
+    # Fallback to simulated
     proceeds = price * sell_qty * 0.9995
     pnl = (price - pos["avg_entry"]) * sell_qty
     _portfolio["cash"] += proceeds
     order_id = str(uuid.uuid4())[:8]
 
-    # Update position
     pos["qty"] -= sell_qty
     if pos["qty"] <= 0:
         del _portfolio["positions"][ticker]
 
     _portfolio["orders"].append({
-        "id": order_id,
-        "ticker": ticker,
-        "side": "sell",
-        "qty": sell_qty,
-        "price": round(price, 2),
-        "total": round(proceeds, 2),
-        "pnl": round(pnl, 2),
-        "status": "filled",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "id": order_id, "ticker": ticker, "side": "sell", "qty": sell_qty,
+        "price": round(price, 2), "total": round(proceeds, 2),
+        "pnl": round(pnl, 2), "status": "filled",
+        "timestamp": datetime.now(timezone.utc).isoformat(), "source": "simulated",
     })
 
     _portfolio["pnl_history"].append({
-        "date": str(date.today()),
-        "ticker": ticker,
-        "pnl": round(pnl, 2),
+        "date": str(date.today()), "ticker": ticker, "pnl": round(pnl, 2),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
     return {
-        "status": "filled",
-        "order_id": order_id,
-        "ticker": ticker,
-        "qty": sell_qty,
-        "price": round(price, 2),
-        "proceeds": round(proceeds, 2),
-        "pnl": round(pnl, 2),
-        "cash_balance": round(_portfolio["cash"], 2),
+        "status": "filled", "order_id": order_id, "ticker": ticker, "qty": sell_qty,
+        "price": round(price, 2), "proceeds": round(proceeds, 2),
+        "pnl": round(pnl, 2), "cash_balance": round(_portfolio["cash"], 2),
+        "source": "simulated",
     }
 
 
@@ -350,7 +461,6 @@ async def run_backtest(tickers: str = Query("SPY,QQQ,IWM"),
                        auth=Depends(require_auth)):
     """Run a new backtest."""
     import subprocess
-    # Trigger the backtest script
     result = subprocess.run(
         ["python3", "/app/backtest/run.py"],
         capture_output=True, text=True, timeout=120
@@ -379,22 +489,17 @@ async def system_health():
     except Exception:
         db_rows = 0
 
+    # Check IBKR gateway
+    gw_status = await gateway.check_gateway()
+
     return {
         "status": "ok",
         "version": "4.0",
         "grade": "A++",
-        "database": {
-            "connected": db_ok,
-            "rows": db_rows,
-        },
-        "portfolio": {
-            "cash": round(_portfolio["cash"], 2),
-            "positions": len(_portfolio["positions"]),
-        },
+        "database": {"connected": db_ok, "rows": db_rows},
+        "portfolio": {"cash": round(_portfolio["cash"], 2), "positions": len(_portfolio["positions"])},
         "broker": IBKR_CONFIG["account"],
         "mode": IBKR_CONFIG["mode"],
-        "regulatory": {
-            "pdt_eliminated": True,
-            "last_verified": "2026-06-17",
-        },
+        "gateway": gw_status,
+        "regulatory": {"pdt_eliminated": True, "last_verified": datetime.now(timezone.utc).isoformat()},
     }
